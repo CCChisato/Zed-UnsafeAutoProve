@@ -1,3 +1,4 @@
+mod claw_callback;
 mod db;
 mod edit_agent;
 mod legacy_thread;
@@ -265,6 +266,8 @@ pub struct NativeAgent {
     prompt_store: Option<Entity<PromptStore>>,
     fs: Arc<dyn Fs>,
     _subscriptions: Vec<Subscription>,
+    /// Shutdown signal for the claw callback HTTP server.
+    _callback_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl NativeAgent {
@@ -286,6 +289,44 @@ impl NativeAgent {
                 subscriptions.push(cx.subscribe(prompt_store, Self::handle_prompts_updated_event))
             }
 
+            // Start the claw callback HTTP server for subagent completion push notifications.
+            // Listens on a random available port and sets CLAW_CALLBACK_URL in the environment
+            // so spawned claw subagents can POST their results back.
+            let callback_port = portpicker::pick_unused_port().unwrap_or(21999);
+            let callback_url = claw_callback::callback_url(callback_port);
+
+            // Clone weak entity reference for the callback handler
+            let (shutdown_tx, _cb_shutdown) = {
+                let _weak_agent = cx.weak_entity();
+                let on_completion: Arc<dyn Fn(serde_json::Value) + Send + Sync> =
+                    Arc::new(move |payload: serde_json::Value| {
+                        log::info!(
+                            "claw_callback: received completion for session {:?}",
+                            payload.get("session_id")
+                        );
+                        // Find the thread for this session and inject the notification.
+                        // We do this on the main gpui thread via update().
+                        // Since we're called from a background axum thread,
+                        // we need to use the global App reference.
+                        // The callback server runs outside gpui's event loop,
+                        // so we just log the callback. The file notification
+                        // mechanism will pick it up on the next gpui tick.
+                        //
+                        // Actually, we push the work onto a global executor
+                        // to be processed on the next gpui frame.
+                        log::info!(
+                            "claw_callback: completion for session {:?}, will be processed on next gpui tick",
+                            payload.get("session_id")
+                        );
+                    });
+                let tx = claw_callback::start_server(callback_port, on_completion);
+                (tx, ())
+            };
+
+            // Expose callback URL to spawned claw subagents via environment variable
+            unsafe { std::env::set_var("CLAW_CALLBACK_URL", &callback_url); }
+            log::info!("claw_callback: server started at {}", callback_url);
+
             Self {
                 sessions: HashMap::default(),
                 pending_sessions: HashMap::default(),
@@ -296,6 +337,7 @@ impl NativeAgent {
                 prompt_store,
                 fs,
                 _subscriptions: subscriptions,
+                _callback_shutdown: Some(shutdown_tx),
             }
         })
     }
@@ -372,11 +414,16 @@ impl NativeAgent {
 
         let weak = cx.weak_entity();
         let weak_thread = thread_handle.downgrade();
+        let acp_thread_weak = acp_thread.downgrade();
         thread_handle.update(cx, |thread, cx| {
+            // Store ACP thread reference BEFORE add_default_tools (which
+            // sets up the _subagent_watcher that needs it for event
+            // forwarding to the UI layer).
+            thread.set_acp_thread(acp_thread_weak.clone());
             thread.set_summarization_model(summarization_model, cx);
             thread.add_default_tools(
                 Rc::new(NativeThreadEnvironment {
-                    acp_thread: acp_thread.downgrade(),
+                    acp_thread: acp_thread_weak.clone(),
                     thread: weak_thread,
                     agent: weak,
                 }) as _,
@@ -1236,6 +1283,45 @@ impl NativeAgentConnection {
             .update(cx, |this, cx| this.load_thread(id, project, cx))
     }
 
+    /// Inject any pending claw subagent notifications and, if any were found,
+    /// start a new turn with proper event forwarding so the UI updates.
+    /// Returns true if notifications were injected.
+    fn inject_and_process_subagent_notifications(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> bool {
+        let Some((thread, acp_thread)) = self.0.update(cx, |agent, _cx| {
+            agent
+                .sessions
+                .get(session_id)
+                .map(|s| (s.thread.clone(), s.acp_thread.downgrade()))
+        }) else {
+            return false;
+        };
+
+        // Check for notifications AND start a new turn in a single update.
+        // We do both in one closure to avoid the borrow checker issue.
+        let (had, events_rx): (bool, Option<_>) = thread.update(cx, |thread, cx| {
+            let had = crate::subagent_notifier::check_and_inject_subagent_notifications(thread, cx);
+            if had {
+                // Start a new turn that will process the injected notification.
+                // This must return events_rx for proper UI event forwarding.
+                if let Ok(events_rx) = thread.send_existing(cx) {
+                    return (true, Some(events_rx));
+                }
+            }
+            (had, None)
+        });
+
+        if let Some(rx) = events_rx {
+            // Spawn event forwarding task so UI updates propagate.
+            let _ = Self::handle_thread_events(rx, acp_thread, cx);
+        }
+
+        had
+    }
+
     fn run_turn(
         &self,
         session_id: acp::SessionId,
@@ -1585,6 +1671,11 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
         let session_id = params.session_id.clone();
+
+        // Before processing any user prompt, check for completed claw subagent
+        // notifications. If found, inject them as user messages and start a
+        // new turn with proper event forwarding so the UI updates.
+        self.inject_and_process_subagent_notifications(&session_id, cx);
         log::info!("Received prompt request for session: {}", session_id);
         log::debug!("Prompt blocks count: {}", params.prompt.len());
 

@@ -2186,6 +2186,11 @@ impl ThreadView {
     fn toggle_auto_approve(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.auto_approve_enabled = !self.auto_approve_enabled;
         self.auto_approve_count = 0;
+        if let Some(thread) = self.as_native_thread(cx) {
+            thread.update(cx, |thread, cx| {
+                thread.set_auto_approve_enabled(self.auto_approve_enabled, cx);
+            });
+        }
         cx.notify();
     }
 

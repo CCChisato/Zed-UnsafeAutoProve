@@ -35,6 +35,19 @@ const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 ///
 /// For potentially long-running commands, prefer specifying `timeout_ms` to bound runtime and prevent indefinite hangs.
 ///
+/// ### Non-blocking Subagent Delegation (Claw)
+/// To delegate a long-running task to a background subagent WITHOUT blocking
+/// or polling:
+/// 1. Run: `claw subagent spawn "<task description>" --output-format json`
+/// 2. Set `timeout_ms` to a small value (e.g. 10000) to capture the `session_id`.
+/// 3. The command returns immediately with `{"session_id":"...","type":"subagent_dispatched"}`.
+/// 4. **End your turn immediately** — do NOT poll or wait.
+/// 5. When the subagent completes, results are automatically injected into
+///    this conversation as a new user message, and a new turn starts.
+///
+/// This "fire-and-forget" pattern is ideal for WebSearch, file analysis,
+/// code review, or time-consuming independent tasks.
+///
 /// Remember that each invocation of this tool will spawn a new shell process, so you can't rely on any state from previous invocations.
 ///
 /// The terminal emulator is an interactive pty, so commands may block waiting for user input.

@@ -75,20 +75,22 @@ impl SubagentNotification {
 /// Check the notification directory for completed subagents and inject
 /// them into the thread's message list.
 ///
+/// Returns `true` if any notifications were found and injected.
+///
 /// This is designed to be called from within the gpui thread context
 /// (e.g. inside a `this.update(cx, ...)` call).
 pub fn check_and_inject_subagent_notifications(
     thread: &mut crate::Thread,
     cx: &mut gpui::Context<crate::Thread>,
-) {
+) -> bool {
     let notif_dir = notifications_dir();
     if !notif_dir.exists() {
-        return;
+        return false;
     }
 
     let entries = match std::fs::read_dir(&notif_dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     // Collect notification files sorted by name (nanosecond timestamps = chronological).
@@ -108,7 +110,7 @@ pub fn check_and_inject_subagent_notifications(
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     if files.is_empty() {
-        return;
+        return false;
     }
 
     let batch: Vec<_> = files
@@ -123,34 +125,39 @@ pub fn check_and_inject_subagent_notifications(
             Err(_) => continue,
         };
 
-        // Try to parse as a native subagent notification first (has "output" raw field),
-        // then fall back to SubagentNotification (claw format with "report" field).
-        let formatted = if let Ok(native) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Use a different formatting for native vs claw notifications
+        // Try to parse as SubagentNotification (claw format with "report" field) first,
+        // then fall back to native format (has "output" raw field).
+        // Detection heuristic: claw notifications have a "report" field (object or null),
+        // native notifications have a "source" field.
+        let formatted = if let Ok(notif) = serde_json::from_str::<SubagentNotification>(&content) {
+            notif.format_as_agent_message()
+        } else if let Ok(native) = serde_json::from_str::<serde_json::Value>(&content) {
+            // Native subagent notification format
             let source = native
                 .get("source")
                 .and_then(|s| s.as_str())
-                .unwrap_or("unknown");
+                .unwrap_or("claw");
             let status = native
                 .get("status")
                 .and_then(|s| s.as_str())
-                .unwrap_or("unknown");
+                .unwrap_or("completed");
             let session_id = native
                 .get("session_id")
                 .and_then(|s| s.as_str())
-                .unwrap_or("unknown");
+                .unwrap_or("?");
             let duration = native
                 .get("duration_ms")
                 .and_then(|s| s.as_u64())
                 .unwrap_or(0);
 
-            let mut msg = format!(
-                "## {} Subagent Completed\n\n**Session**: `{}`\n**Status**: `{}`\n**Duration**: {}s\n\n",
-                source,
-                session_id,
-                status,
+            let mut msg = format!("## Subagent Task Results\n\n");
+            msg.push_str(&format!("**Session**: `{}`\n", session_id));
+            msg.push_str(&format!("**Source**: {}\n", source));
+            msg.push_str(&format!("**Status**: `{}`\n", status));
+            msg.push_str(&format!(
+                "**Duration**: {:.1}s\n\n",
                 duration as f64 / 1000.0
-            );
+            ));
 
             if let Some(output) = native.get("output").and_then(|s| s.as_str()) {
                 if !output.is_empty() {
@@ -164,10 +171,7 @@ pub fn check_and_inject_subagent_notifications(
                 }
             }
 
-            msg.push_str("*(Use `check_subagent_status` with the session_id for full details)*");
             msg
-        } else if let Ok(notification) = serde_json::from_str::<SubagentNotification>(&content) {
-            notification.format_as_agent_message()
         } else {
             continue;
         };
@@ -187,4 +191,5 @@ pub fn check_and_inject_subagent_notifications(
     if had_new {
         cx.notify();
     }
+    had_new
 }

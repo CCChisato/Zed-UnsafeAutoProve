@@ -152,6 +152,7 @@ dependencies = [
  "agent_servers",
  "agent_settings",
  "anyhow",
+ "axum",
  "chrono",
  "client",
  "clock",
@@ -185,6 +186,7 @@ dependencies = [
  "open",
  "parking_lot",
  "paths",
+ "portpicker",
  "pretty_assertions",
  "project",
  "prompt_store",
@@ -208,6 +210,7 @@ dependencies = [
  "text",
  "theme",
  "thiserror 2.0.17",
+ "tokio",
  "ui",
  "unindent",
  "url",
@@ -13204,6 +13207,15 @@ dependencies = [
  "shell-words",
  "winapi",
  "winreg 0.10.1",
+]
+
+[[package]]
+name = "portpicker"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be97d76faf1bfab666e1375477b23fde79eccf0276e9b63b92a39d676a889ba9"
+dependencies = [
+ "rand 0.8.5",
 ]
 
 [[package]]

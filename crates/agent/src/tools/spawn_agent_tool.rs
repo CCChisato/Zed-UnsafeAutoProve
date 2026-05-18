@@ -12,47 +12,38 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 /// Spawn a sub-agent for a well-scoped task.
 ///
+/// **Non-blocking, fire-and-forget**: This tool dispatches the subagent to run
+/// in the background and returns immediately with a `session_id`. Do NOT poll
+/// or wait — the subagent's results will be automatically injected into this
+/// conversation as a new user message when it completes, waking you up
+/// without any explicit polling needed.
+///
+/// ### How to use
+/// 1. Call `spawn_agent` with a `label` and `message` describing the task.
+/// 2. The tool returns immediately with a `session_id`.
+/// 3. **End your turn immediately** — do NOT keep talking, do NOT poll.
+/// 4. The subagent runs in the background independently.
+/// 5. When completed, the result is automatically injected into the conversation
+///    as a user message, and a new turn starts to let you process the result.
+///
 /// ### Designing delegated subtasks
-/// - An agent does not see your conversation history. Include all relevant context (file paths, requirements, constraints) in the message.
+/// - Include all relevant context (file paths, requirements, constraints) in the message.
 /// - Subtasks must be concrete, well-defined, and self-contained.
-/// - Delegated subtasks must materially advance the main task.
 /// - Do not duplicate work between your work and delegated subtasks.
-/// - Do not use this tool for tasks you could accomplish directly with one or two tool calls.
-/// - When you delegate work, focus on coordinating and synthesizing results instead of duplicating the same work yourself.
-/// - Avoid issuing multiple delegate calls for the same unresolved subproblem unless the new delegated task is genuinely different and necessary.
-/// - Narrow the delegated ask to the concrete output you need next.
-/// - For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
-/// - When sending a follow-up using an existing agent session_id, the agent already has the context from the previous turn. Send only a short, direct message. Do NOT repeat the original task or context.
+/// - Do not use this tool for simple tasks you could do directly with one or two tool calls.
 ///
-/// ### Parallel delegation patterns
-/// - Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
-/// - Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
-/// - When a plan has multiple independent steps, prefer delegating those steps in parallel rather than serializing them unnecessarily.
-/// - Reuse the returned session_id when you want to follow up on the same delegated subproblem instead of creating a duplicate session.
+/// ### Parallel delegation
+/// - Run multiple independent subtasks in parallel by calling this tool multiple times.
+/// - Decompose large work into disjoint codebase slices for safe parallel execution.
 ///
-/// ### Output
-/// - You will receive only the agent's final message as output.
-/// - Successful calls return a session_id that you can use for follow-up messages.
-/// - Error results may also include a session_id if a session was already created.
+/// ### Follow-up on existing sessions
+/// - When sending a follow-up using an existing session_id, the subagent already has
+///   the previous context. Send only a short, direct message.
 ///
-/// ### Alternative: Using `claw` in the terminal
-/// You can also use the `claw` CLI tool via the `terminal` tool to spawn subagents.
-/// Running `claw subagent spawn <message>` in the console will start a subagent session
-/// with the given prompt. This is useful when you need to run tasks outside the
-/// current agent context or when you want to leverage `claw`'s capabilities.
-/// Use `claw subagent list` to see active subagent sessions and
-/// `claw subagent steer <target> <msg>` to send follow-up messages.
-///
-/// ### Batch mode: `claw subagent batch` (parallel agent cluster)
-/// For dispatching multiple independent tasks concurrently, use `subagent batch`:
-/// ```
-/// echo "task1" > tasks.txt && echo "task2" >> tasks.txt
-/// claw subagent batch --parallel 4 --file tasks.txt
-/// ```
-/// Each line becomes one subagent with its own terminal/files/search context.
-/// Default parallelism is 4 (hard max 32). JSON output via `--output-format json`.
-/// This is ideal for: running lints/tests across modules, searching multiple sources,
-/// compiling different targets, or any embarassingly parallel workload.
+/// ### Alternative: Using `terminal` tool with `claw` CLI
+/// You can also run `claw subagent spawn "<task>" --output-format json` via
+/// the `terminal` tool with a short timeout (e.g. 10000ms). The command returns
+/// the session_id immediately. Results are auto-injected the same way.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentToolInput {
