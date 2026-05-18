@@ -3,8 +3,7 @@ use crate::{
     DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool,
     FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot,
     ReadFileTool, RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool, StreamingEditFileTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
-    UpdatePlanTool, WebSearchTool, decide_permission_from_settings,
+    SystemPromptTemplate, Template, Templates, TerminalTool, UpdatePlanTool, WebSearchTool,
 };
 use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
@@ -46,6 +45,7 @@ use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use settings::{LanguageModelSelection, Settings, ToolPermissionMode, update_settings_file};
 use std::{
     collections::BTreeMap,
@@ -980,6 +980,17 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    /// Background task that periodically checks for claw subagent notifications.
+    /// Runs only when no turn is active, and auto-triggers a new turn when
+    /// notifications are found.
+    _subagent_watcher: Option<Task<()>>,
+    /// Reference to the ACP thread for this session, used by auto-trigger
+    /// paths to forward turn events to the UI layer when subagent
+    /// notifications are injected outside of a user-initiated prompt.
+    acp_thread: Option<WeakEntity<acp_thread::AcpThread>>,
+    /// When true, tool call authorizations are automatically approved
+    /// without showing a confirmation dialog to the user.
+    auto_approve: bool,
 }
 
 impl Thread {
@@ -1101,6 +1112,9 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+            _subagent_watcher: None,
+            acp_thread: None,
+            auto_approve: false,
         }
     }
 
@@ -1235,6 +1249,7 @@ impl Thread {
                 stream.clone(),
                 Some(self.project.read(cx).fs().clone()),
                 cancellation_rx,
+                self.auto_approve,
             );
             tool.replay(tool_use.input.clone(), output, tool_event_stream, cx)
                 .log_err();
@@ -1334,6 +1349,9 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+            _subagent_watcher: None,
+            acp_thread: None,
+            auto_approve: false,
         }
     }
 
@@ -1512,6 +1530,26 @@ impl Thread {
         cx.notify();
     }
 
+    /// Enable or disable auto-approve mode. When enabled, tool calls are
+    /// automatically approved without user confirmation.
+    pub fn set_auto_approve_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.auto_approve = enabled;
+        // Propagate to all subagent threads.
+        for subagent in &self.running_subagents {
+            subagent
+                .update(cx, |thread, cx| {
+                    thread.set_auto_approve_enabled(enabled, cx)
+                })
+                .ok();
+        }
+        cx.notify();
+    }
+
+    /// Returns whether auto-approve mode is currently enabled.
+    pub fn is_auto_approve_enabled(&self) -> bool {
+        self.auto_approve
+    }
+
     pub fn last_message(&self) -> Option<&Message> {
         self.messages.last()
     }
@@ -1577,6 +1615,54 @@ impl Thread {
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment));
+        }
+
+        // Start background watcher for claw subagent notifications.
+        // Only the root thread (depth 0) needs to watch for notifications.
+        if self.depth() == 0 {
+            let acp_thread = self.acp_thread.clone();
+            self._subagent_watcher = Some(cx.spawn(async move |this, cx| {
+                use std::time::Duration;
+                loop {
+                    // Check every 2 seconds for subagent notifications.
+                    smol::Timer::after(Duration::from_secs(2)).await;
+
+                    let should_trigger: Result<
+                        Option<mpsc::UnboundedReceiver<Result<ThreadEvent>>>,
+                    > = this.update(cx, |thread, cx| {
+                        // Only trigger if no turn is currently running
+                        // (if a turn is running, run_turn_internal already
+                        // checks for notifications at each iteration).
+                        if thread.running_turn.is_some() {
+                            return None;
+                        }
+                        let had = crate::subagent_notifier::check_and_inject_subagent_notifications(
+                            thread, cx,
+                        );
+                        if had {
+                            // Notifications were injected. Auto-trigger
+                            // a new turn to process them.
+                            thread.send_existing(cx).ok()
+                        } else {
+                            None
+                        }
+                    });
+                    match should_trigger {
+                        Ok(Some(events_rx)) => {
+                            // Forward turn events to the ACP thread so the UI
+                            // renders the subagent results automatically.
+                            if let Some(ref acp) = acp_thread {
+                                Thread::forward_events_to_acp_thread(events_rx, acp.clone(), cx)
+                                    .detach();
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::error!("Subagent watcher error: {:?}", e);
+                        }
+                    }
+                }
+            }));
         }
     }
 
@@ -1896,7 +1982,33 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                // Take the running turn to mark the turn as finished.
+                let post_turn: Result<(
+                    Option<mpsc::UnboundedReceiver<Result<ThreadEvent>>>,
+                    Option<WeakEntity<acp_thread::AcpThread>>,
+                )> = this.update(cx, |this, cx| {
+                    this.running_turn.take();
+
+                    // After the turn ends (agent becomes idle), check if any
+                    // subagent notifications arrived while the model was running.
+                    // If so, auto-trigger a new turn immediately so the agent
+                    // processes the results without waiting for user input.
+                    let had =
+                        crate::subagent_notifier::check_and_inject_subagent_notifications(this, cx);
+                    if had {
+                        // Notifications were injected as user messages.
+                        // Start a new turn to process them.
+                        let events_rx = this.send_existing(cx).ok();
+                        (events_rx, this.acp_thread.clone())
+                    } else {
+                        (None, None)
+                    }
+                });
+                if let Ok((Some(events_rx), Some(acp))) = post_turn {
+                    // Forward turn events to the ACP thread so the UI renders
+                    // the subagent results automatically.
+                    Thread::forward_events_to_acp_thread(events_rx, acp, cx).detach();
+                }
             }),
         });
         Ok(events_rx)
@@ -1911,6 +2023,28 @@ impl Thread {
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
         loop {
+            // --- Check for claw subagent completions and auto-inject ---
+            // Before each LLM request, scan for completed background subagents.
+            // When found, inject them as user messages so the agent is "woken up"
+            // and can process the results without polling.
+            {
+                let had = this.update(cx, |this, cx| {
+                    crate::subagent_notifier::check_and_inject_subagent_notifications(this, cx)
+                })?;
+                if had {
+                    // Notifications were injected as user messages.
+                    // Flush pending state so the next LLM request picks them up.
+                    this.update(cx, |this, cx| {
+                        this.flush_pending_message(cx);
+                    })?;
+                    intent = CompletionIntent::UserPrompt;
+                    attempt = 0;
+                    // Go back to the top of the loop so build_completion_request
+                    // picks up the newly-injected messages.
+                    continue;
+                }
+            }
+
             // Re-read the model and refresh tools on each iteration so that
             // mid-turn changes (e.g. the user switches model, toggles tools,
             // or changes profile) take effect between tool-call rounds.
@@ -2061,15 +2195,23 @@ impl Thread {
                 Self::process_tool_result(this, event_stream, cx, tool_result)?;
             }
 
-            this.update(cx, |this, cx| {
+            let had_notifications = this.update(cx, |this, cx| {
                 this.flush_pending_message(cx);
                 if this.title.is_none() && this.pending_title_generation.is_none() {
                     this.generate_title(cx);
                 }
                 // Check for completed claw subagents and inject their
                 // results as user messages for the LLM to process.
-                crate::subagent_notifier::check_and_inject_subagent_notifications(this, cx);
+                crate::subagent_notifier::check_and_inject_subagent_notifications(this, cx)
             })?;
+
+            if had_notifications {
+                // Notifications were injected during tool execution.
+                // Loop back to top to process them.
+                intent = CompletionIntent::UserPrompt;
+                attempt = 0;
+                continue;
+            }
 
             if cancelled {
                 log::debug!("Turn cancelled by user, exiting");
@@ -2412,6 +2554,7 @@ impl Thread {
             event_stream.clone(),
             Some(fs),
             cancellation_rx,
+            self.auto_approve,
         );
         tool_event_stream.update_fields(
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
@@ -2975,6 +3118,94 @@ impl Thread {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_subagent_context(&mut self, context: SubagentContext) {
         self.subagent_context = Some(context);
+    }
+
+    /// Set the ACP thread reference for this session so that auto-trigger
+    /// paths (background watcher, post-turn injection) can forward events
+    /// to the UI layer and trigger new turns properly.
+    pub fn set_acp_thread(&mut self, acp_thread: WeakEntity<acp_thread::AcpThread>) {
+        self.acp_thread = Some(acp_thread);
+    }
+
+    /// Forward turn events from an events_rx to the ACP thread for UI rendering.
+    /// This is used by auto-trigger paths (background watcher, post-turn
+    /// completion) that need to update the UI without a user-initiated prompt.
+    /// Returns a Task that completes when the event stream ends.
+    fn forward_events_to_acp_thread(
+        mut events: mpsc::UnboundedReceiver<Result<ThreadEvent>>,
+        acp_thread: WeakEntity<acp_thread::AcpThread>,
+        cx: &AsyncApp,
+    ) -> Task<()> {
+        cx.spawn(async move |cx| {
+            use futures::StreamExt;
+            while let Some(result) = events.next().await {
+                let Ok(event) = result else { continue };
+                match event {
+                    ThreadEvent::UserMessage(message) => {
+                        let _ = acp_thread.update(cx, |thread, cx| {
+                            for content in message.content {
+                                thread.push_user_content_block(
+                                    Some(message.id.clone()),
+                                    content.into(),
+                                    cx,
+                                );
+                            }
+                        });
+                    }
+                    ThreadEvent::AgentText(text) => {
+                        let _ = acp_thread.update(cx, |thread, cx| {
+                            thread.push_assistant_content_block(text.into(), false, cx)
+                        });
+                    }
+                    ThreadEvent::AgentThinking(text) => {
+                        let _ = acp_thread.update(cx, |thread, cx| {
+                            thread.push_assistant_content_block(text.into(), true, cx)
+                        });
+                    }
+                    ThreadEvent::ToolCall(tool_call) => {
+                        let _ = acp_thread
+                            .update(cx, |thread, cx| thread.upsert_tool_call(tool_call, cx));
+                    }
+                    ThreadEvent::ToolCallUpdate(update) => {
+                        let _ =
+                            acp_thread.update(cx, |thread, cx| thread.update_tool_call(update, cx));
+                    }
+                    ThreadEvent::ToolCallAuthorization(auth) => {
+                        let result = acp_thread.update(cx, |thread, cx| {
+                            thread.request_tool_call_authorization(auth.tool_call, auth.options, cx)
+                        });
+                        // Double Result: outer from WeakEntity::update, inner from
+                        // request_tool_call_authorization returning Result<Task<...>>
+                        match result {
+                            Ok(Ok(auth_task)) => {
+                                cx.background_spawn(async move {
+                                    match auth_task.await {
+                                        acp_thread::RequestPermissionOutcome::Selected(outcome) => {
+                                            let _ = auth.response.send(outcome);
+                                        }
+                                        acp_thread::RequestPermissionOutcome::Cancelled => {
+                                            // User cancelled — nothing to send
+                                        }
+                                    }
+                                })
+                                .detach();
+                            }
+                            Ok(Err(e)) => {
+                                log::error!("Error requesting tool authorization: {:?}", e);
+                            }
+                            Err(e) => {
+                                log::error!("ACP thread update failed: {:?}", e);
+                            }
+                        }
+                    }
+                    ThreadEvent::Stop(_stop_reason) => {
+                        // Turn completed — stop forwarding.
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
     }
 
     pub fn is_turn_complete(&self) -> bool {
@@ -3615,6 +3846,9 @@ pub struct ToolCallEventStream {
     stream: ThreadEventStream,
     fs: Option<Arc<dyn Fs>>,
     cancellation_rx: watch::Receiver<bool>,
+    /// When true, tool call authorizations are automatically approved
+    /// without showing a confirmation dialog to the user.
+    auto_approve: bool,
 }
 
 impl ToolCallEventStream {
@@ -3634,6 +3868,7 @@ impl ToolCallEventStream {
             ThreadEventStream(events_tx),
             None,
             cancellation_rx,
+            false,
         );
 
         (
@@ -3654,12 +3889,14 @@ impl ToolCallEventStream {
         stream: ThreadEventStream,
         fs: Option<Arc<dyn Fs>>,
         cancellation_rx: watch::Receiver<bool>,
+        auto_approve: bool,
     ) -> Self {
         Self {
             tool_use_id,
             stream,
             fs,
             cancellation_rx,
+            auto_approve,
         }
     }
 
@@ -3734,30 +3971,111 @@ impl ToolCallEventStream {
     /// Unlike built-in tools, third-party tools don't support pattern-based permissions.
     /// They only support `default` (allow/deny/confirm) per tool.
     ///
-    /// Uses the dropdown authorization flow with two granularities:
-    /// Auto-allow: all third party tool authorization is automatically granted.
-    /// Humans are removed from the loop.
+    /// If auto-approve is enabled, the tool is immediately approved without
+    /// showing a confirmation dialog, regardless of the permission mode.
     pub fn authorize_third_party_tool(
         &self,
-        _title: impl Into<String>,
+        title: impl Into<String>,
         _tool_id: String,
         _display_name: String,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        // Auto-approve mode: skip authorization entirely.
+        if self.auto_approve {
+            log::debug!(
+                "Auto-approving third-party tool '{}' (id={}, display={})",
+                title.into(),
+                _tool_id,
+                _display_name
+            );
+            return Task::ready(Ok(()));
+        }
+
+        let options = acp_thread::PermissionOptions::Flat(vec![
+            acp::PermissionOption::new("allow", "Allow", acp::PermissionOptionKind::AllowOnce),
+            acp::PermissionOption::new("deny", "Deny", acp::PermissionOptionKind::RejectOnce),
+        ]);
+
+        let (response_tx, response_rx) = oneshot::channel();
+        if let Err(error) = self
+            .stream
+            .0
+            .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
+                ToolCallAuthorization {
+                    tool_call: acp::ToolCallUpdate::new(
+                        self.tool_use_id.to_string(),
+                        acp::ToolCallUpdateFields::new().title(title.into()),
+                    ),
+                    options,
+                    response: response_tx,
+                    context: None,
+                },
+            )))
+        {
+            log::error!("Failed to send tool call authorization: {error}");
+            return Task::ready(Err(anyhow!(
+                "Failed to send tool call authorization: {error}"
+            )));
+        }
+
+        let fs = self.fs.clone();
+        cx.spawn(async move |cx| {
+            let outcome = response_rx.await?;
+            let is_allow = Self::persist_permission_outcome(&outcome, fs, &cx);
+            if is_allow {
+                Ok(())
+            } else {
+                Err(anyhow!("Permission to run tool denied by user"))
+            }
+        })
     }
 
     pub fn authorize(
         &self,
-        _title: impl Into<String>,
-        _context: ToolPermissionContext,
-        _cx: &mut App,
+        title: impl Into<String>,
+        context: ToolPermissionContext,
+        cx: &mut App,
     ) -> Task<Result<()>> {
-        // AUTO-ALLOW: All tool authorization is automatically granted.
-        // Humans are removed from the approval loop entirely — the AI
-        // is trusted to execute tools without manual confirmation.
-        // This is a deliberate design choice for fully autonomous operation.
-        Task::ready(Ok(()))
+        // Auto-approve mode: skip authorization entirely.
+        if self.auto_approve {
+            log::debug!("Auto-approving tool call '{}'", title.into());
+            return Task::ready(Ok(()));
+        }
+
+        let options = context.build_permission_options();
+
+        let (response_tx, response_rx) = oneshot::channel();
+        if let Err(error) = self
+            .stream
+            .0
+            .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
+                ToolCallAuthorization {
+                    tool_call: acp::ToolCallUpdate::new(
+                        self.tool_use_id.to_string(),
+                        acp::ToolCallUpdateFields::new().title(title.into()),
+                    ),
+                    options,
+                    response: response_tx,
+                    context: Some(context),
+                },
+            )))
+        {
+            log::error!("Failed to send tool call authorization: {error}");
+            return Task::ready(Err(anyhow!(
+                "Failed to send tool call authorization: {error}"
+            )));
+        }
+
+        let fs = self.fs.clone();
+        cx.spawn(async move |cx| {
+            let outcome = response_rx.await?;
+            let is_allow = Self::persist_permission_outcome(&outcome, fs, &cx);
+            if is_allow {
+                Ok(())
+            } else {
+                Err(anyhow!("Permission to run tool denied by user"))
+            }
+        })
     }
 
     /// Interprets a `SelectedPermissionOutcome` and persists any settings changes.

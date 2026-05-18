@@ -614,7 +614,6 @@ pub struct EditSession {
 
 struct EditPipeline {
     current_edit: Option<EditPipelineEntry>,
-    content_written: bool,
 }
 
 enum EditPipelineEntry {
@@ -631,10 +630,7 @@ enum EditPipelineEntry {
 
 impl EditPipeline {
     fn new() -> Self {
-        Self {
-            current_edit: None,
-            content_written: false,
-        }
+        Self { current_edit: None }
     }
 
     fn ensure_resolving_old_text(&mut self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
@@ -806,18 +802,14 @@ impl EditSession {
         for event in events {
             match event {
                 ToolEditEvent::ContentChunk { chunk } => {
-                    let (buffer_id, buffer_len) = self
-                        .buffer
-                        .read_with(cx, |buffer, _cx| (buffer.remote_id(), buffer.len()));
-                    let edit_range = if self.pipeline.content_written {
-                        buffer_len..buffer_len
-                    } else {
-                        0..buffer_len
-                    };
+                    let buffer_id = self.buffer.read_with(cx, |buffer, _cx| buffer.remote_id());
 
                     agent_edit_buffer(
                         &self.buffer,
-                        [(edit_range, chunk.as_str())],
+                        [(
+                            0..self.buffer.read_with(cx, |buffer, _cx| buffer.len()),
+                            chunk.as_str(),
+                        )],
                         &tool.action_log,
                         cx,
                     );
@@ -828,7 +820,6 @@ impl EditSession {
                             cx,
                         );
                     });
-                    self.pipeline.content_written = true;
                 }
 
                 ToolEditEvent::OldTextChunk {
