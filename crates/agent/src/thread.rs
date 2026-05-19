@@ -2,11 +2,13 @@ use crate::{
     CheckSubagentStatusTool, ContextServerRegistry, CopyPathTool, CreateDirectoryTool,
     DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool,
     FindPathTool, GrepTool, ListDirectoryTool, MovePathTool, NowTool, OpenTool, ProjectSnapshot,
-    ReadFileTool, RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool, StreamingEditFileTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, UpdatePlanTool, WebSearchTool,
+    ReadErrorsTool, ReadFileTool, RestoreFileFromDiskTool, SaveFileTool, SpawnAgentTool,
+    StreamingEditFileTool, SystemPromptTemplate, Template, Templates, TerminalTool, UpdatePlanTool,
+    WebSearchTool, error_collector::ErrorCollector,
 };
 use acp_thread::{MentionUri, UserMessageId};
 use action_log::ActionLog;
+use db::kvp::KeyValueStore;
 use feature_flags::{
     FeatureFlagAppExt as _, StreamingEditFileToolFeatureFlag, UpdatePlanToolFeatureFlag,
 };
@@ -1601,6 +1603,7 @@ impl Thread {
         if cx.has_flag::<UpdatePlanToolFeatureFlag>() {
             self.add_tool(UpdatePlanTool);
         }
+        self.add_tool(ReadErrorsTool::new(self.project.clone()));
         self.add_tool(ReadFileTool::new(
             self.project.clone(),
             self.action_log.clone(),
@@ -2264,6 +2267,31 @@ impl Thread {
         tool_result: LanguageModelToolResult,
     ) -> Result<(), anyhow::Error> {
         log::debug!("Tool finished {:?}", tool_result);
+
+        // Record tool execution errors to the persistent error collector
+        // for later analysis (e.g. "why did the user's PDF fail to load?").
+        if tool_result.is_error {
+            let message = match &tool_result.content {
+                LanguageModelToolResultContent::Text(text) => text.to_string(),
+                LanguageModelToolResultContent::Image(_) => {
+                    "[image output — see attached]".to_string()
+                }
+            };
+            let name = tool_result.tool_name.clone();
+            let output = tool_result.output.clone();
+            if let Some(collector) =
+                cx.update(|cx| Some(ErrorCollector::new(&KeyValueStore::global(cx).connection())))
+            {
+                cx.foreground_executor()
+                    .spawn(async move {
+                        collector
+                            .record_tool_error(&message, name.as_ref(), None, output)
+                            .await
+                            .log_err();
+                    })
+                    .detach();
+            }
+        }
 
         event_stream.update_tool_call_fields(
             &tool_result.tool_use_id,

@@ -9,11 +9,21 @@ use crate::{
     write_and_log,
 };
 
-pub struct KeyValueStore(crate::sqlez::thread_safe_connection::ThreadSafeConnection);
+pub struct KeyValueStore(pub(crate) crate::sqlez::thread_safe_connection::ThreadSafeConnection);
 
 impl KeyValueStore {
     pub fn from_app_db(db: &crate::AppDatabase) -> Self {
         Self(db.0.clone())
+    }
+
+    /// Build a store from an existing connection without requiring a GPUI cx.
+    pub fn from_connection(connection: &ThreadSafeConnection) -> Self {
+        Self(connection.clone())
+    }
+
+    /// Borrow the inner connection.
+    pub fn connection(&self) -> &ThreadSafeConnection {
+        &self.0
     }
 }
 

@@ -385,7 +385,22 @@ pub fn into_deepseek(
                                 tool_call_id: tool_result.tool_use_id.to_string(),
                             });
                         }
-                        LanguageModelToolResultContent::Image(_) => {}
+                        LanguageModelToolResultContent::Image(image) => {
+                            let content = match image.size {
+                                Some(size) => format!(
+                                    "Tool returned an image result ({}x{}), omitted because this model does not support images.",
+                                    size.width, size.height
+                                ),
+                                None => format!(
+                                    "Tool returned an image result ({} base64 chars), omitted because this model does not support images.",
+                                    image.source.len()
+                                ),
+                            };
+                            messages.push(deepseek::RequestMessage::Tool {
+                                content,
+                                tool_call_id: tool_result.tool_use_id.to_string(),
+                            });
+                        }
                     };
                 }
             }
