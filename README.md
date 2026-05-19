@@ -8,51 +8,6 @@
 
 A fork of Zed — a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter) — customized for **fully autonomous agentic workflows** using cheap/abundant LLM APIs like **DeepSeek**.
 
-This fork works cooperatively with the [Claw-Code-DeepSeek-Default-Proxy](https://github.com/CCChisato/Claw-Code-DeepSeek-Default-Proxy)
-
-We have sinned against upstream Zed, Mozilla, and the Rust compiler.
-
-What started as innocent modifications spiraled into a full-blown
-vibe-coded masterpiece of technical debt held together by hope:
-
-  🧠 Non-blocking subagent system
-    - `claw subagent spawn` dispatches background agents, returns immediately
-    - Dual notification channels: file polling (~/.claw/sessions/notifications/)
-      + HTTP callback (CLAW_CALLBACK_URL via embedded axum server)
-    - Auto-injection of results as user messages, auto-trigger of new turns
-    - Full event forwarding to UI layer (UserMessage, AgentText, ToolCall, etc.)
-    - Subagent status/ouput/list/batch CLI subcommands
-
-  🛡️ Auto-approve (now actually works for concurrent tool calls)
-    - Thread stores auto_approve state (was: propagated but never saved)
-    - ToolCallEventStream carries auto_approve flag, skips authorization
-      entirely when enabled — no more half-approved concurrent Run Commands
-    - Both authorize() and authorize_third_party_tool() respect the flag
-
-  🔄 Auto-summary + Auto-cycle (heartbeat)
-    - Configurable threshold-based summary generation
-    - Periodic heartbeat prompt for long-running autonomous tasks
-
-  🖼️ Custom background images for editor/workspace
-
-  🔗 Claw collaborative agent integration
-    - spawn_agent / check_subagent_status tools
-    - Cross-process agent orchestration with structured reports
-
-Known sins committed:
-  - unsafe { std::env::set_var("CLAW_CALLBACK_URL", ...) }
-  - #[allow(unused)] on fields that might be needed "someday"
-  - log::error!("...") without recovering — just keep going
-  - Match-on-Result-of-Result patterns that would make any Rustacean weep
-  - A file called 'nul' that breaks Windows git (now gitignored)
-  - CallbackState.port: declared, initialized, never read
-
-We apologize to:
-  - The Mozilla project (for what we've done to Servo's child)
-  - The Rust community (for every unwrap() we committed)
-  - The upstream Zed team (for this fork that compiles but shouldn't)
-
-It works. Somehow. Don't look too closely.
 ---
 
 ## ✨ Custom Features
