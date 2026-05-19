@@ -1,4 +1,5 @@
 mod claw_callback;
+pub mod error_collector;
 mod db;
 mod edit_agent;
 mod legacy_thread;
